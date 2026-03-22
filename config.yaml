@@ -4,23 +4,23 @@
 # Search criteria - these map to Zillow search filters
 search:
   # Location: city/state, zip code, or neighborhood
-  location: "Austin, TX"
+  location: "Los Angeles, CA"
 
   # Price range (USD)
-  min_price: 300000
-  max_price: 600000
+  min_price: 800000
+  max_price: 1200000
 
   # Bedrooms
   min_beds: 3
-  max_beds: 5
+  max_beds: null
 
   # Bathrooms
   min_baths: 2
-  max_baths: 4
+  max_baths: null
 
   # Square footage
   min_sqft: 1500
-  max_sqft: 4000
+  max_sqft: null
 
   # Lot size in sqft (null to skip)
   min_lot_sqft: null
@@ -30,7 +30,6 @@ search:
   # Options: SingleFamily, Condo, Townhouse, MultiFamily, Manufactured, Land, Apartment
   home_types:
     - SingleFamily
-    - Townhouse
 
   # Max days on Zillow (null for any)
   days_on_zillow: 7
@@ -43,13 +42,13 @@ search:
   keywords: []
 
   # Year built range (null to skip)
-  min_year_built: 1990
+  min_year_built: null
   max_year_built: null
 
   # Has specific features (true/false/null to skip)
-  has_garage: true
+  has_garage: null
   has_pool: null
-  has_ac: true
+  has_ac: null
 
 # LLM evaluation criteria
 # The monitor uses Claude's vision to evaluate listing photos and descriptions.
@@ -75,23 +74,10 @@ evaluation:
 
     yard:
       description: >
-        Spacious backyard suitable for kids and entertaining. Prefer
-        mature trees for shade, well-maintained lawn, and room for
-        outdoor activities. A patio or deck is a plus.
-      min_score: 5
-
-    appearance:
-      description: >
-        Good curb appeal with well-maintained exterior. Modern or
-        classic style that looks well cared for. Clean, move-in ready
-        interior with updated flooring and fixtures.
+        Spacious backyard or outdoor space suitable for kids and
+        entertaining. Prefer mature trees for shade, well-maintained
+        lawn, and room for outdoor activities. A patio or deck is a plus.
       min_score: 6
-
-  # Additional custom criteria (add as many as you want)
-  # example:
-  #   bathroom:
-  #     description: "Updated bathrooms with modern fixtures"
-  #     min_score: 5
 
 # Notification settings
 notifications:
