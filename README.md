@@ -64,6 +64,41 @@ For Gmail, use an [App Password](https://support.google.com/accounts/answer/1858
 3. Generate a password for "Mail"
 4. Use that as `ZILLOW_EMAIL_PASSWORD`
 
+## Deploy on GitHub Actions (Free)
+
+The included workflow runs the monitor every hour for free on GitHub Actions.
+
+### Setup
+
+1. Push this repo to GitHub
+2. Go to **Settings > Secrets and variables > Actions**
+3. Add these repository secrets:
+
+| Secret | Value |
+|--------|-------|
+| `ANTHROPIC_API_KEY` | Your Anthropic API key |
+| `ZILLOW_EMAIL_USER` | Your Gmail address |
+| `ZILLOW_EMAIL_PASSWORD` | Gmail App Password ([how to create](https://support.google.com/accounts/answer/185833)) |
+| `ZILLOW_EMAIL_FROM` | (Optional) From address, defaults to `ZILLOW_EMAIL_USER` |
+
+4. The workflow runs automatically every hour. You can also trigger it manually from **Actions > Zillow Monitor > Run workflow**.
+
+### Adjusting the Schedule
+
+Edit `.github/workflows/monitor.yml` and change the cron expression:
+
+```yaml
+schedule:
+  - cron: "0 * * * *"     # Every hour (default)
+  - cron: "0 */2 * * *"   # Every 2 hours
+  - cron: "0 9,17 * * *"  # 9am and 5pm UTC
+```
+
+### What Gets Persisted
+
+- **Seen listings**: Cached between runs so you only get alerted on new listings
+- **Results**: Saved as workflow artifacts (retained 30 days)
+
 ## CLI Options
 
 ```
