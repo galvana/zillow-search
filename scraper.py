@@ -1,40 +1,21 @@
 """
 Zillow scraper module.
 
-Uses Zillow's search API to find listings matching configured criteria.
+Uses Playwright to browse Zillow and extract listing data, avoiding API-level blocking.
 """
 
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from urllib.parse import quote_plus
 
-import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 logger = logging.getLogger(__name__)
 
-# Zillow search API endpoint (public, used by their frontend)
-ZILLOW_SEARCH_URL = "https://www.zillow.com/async-create-search-page-state"
 ZILLOW_LISTING_URL = "https://www.zillow.com/homedetails/{zpid}_zpid/"
-
-HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/json",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://www.zillow.com/",
-    "Origin": "https://www.zillow.com",
-    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-}
 
 # Mapping from config home types to Zillow's internal type codes
 HOME_TYPE_MAP = {
@@ -71,10 +52,17 @@ class Listing:
     raw_data: dict = field(default_factory=dict, repr=False)
 
 
-def _build_search_query(config: dict) -> dict:
-    """Build the Zillow search query from config."""
-    search = config["search"]
+def _build_search_url(location: str) -> str:
+    """Build a Zillow search URL for the given location."""
+    slug = location.lower().strip()
+    slug = re.sub(r"[,\s]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return f"https://www.zillow.com/{slug}/"
 
+
+def _build_filter_query_param(config: dict) -> str:
+    """Build the searchQueryState filter as a URL query parameter."""
+    search = config["search"]
     filter_state = {}
 
     # Price
@@ -165,25 +153,14 @@ def _build_search_query(config: dict) -> dict:
     elif status == "ForRent":
         filter_state["isForRent"] = {"value": True}
 
-    return {
-        "searchQueryState": {
-            "usersSearchTerm": search.get("location", ""),
-            "filterState": filter_state,
-            "isListVisible": True,
-            "mapZoom": 10,
-        },
-        "wants": {"cat1": ["listResults"]},
-        "requestId": 2,
+    query_state = {
+        "usersSearchTerm": search.get("location", ""),
+        "filterState": filter_state,
+        "isListVisible": True,
+        "mapZoom": 10,
     }
 
-
-def _build_search_url(location: str) -> str:
-    """Build a Zillow search URL for the given location."""
-    # Normalize location to URL-friendly format
-    slug = location.lower().strip()
-    slug = re.sub(r"[,\s]+", "-", slug)
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return f"https://www.zillow.com/{slug}/"
+    return json.dumps(query_state, separators=(",", ":"))
 
 
 def _parse_listing(result: dict) -> Listing | None:
@@ -193,7 +170,6 @@ def _parse_listing(result: dict) -> Listing | None:
         if not zpid:
             return None
 
-        # Extract photos
         photos = []
         for photo in result.get("carouselPhotos", []):
             url = photo.get("url", "")
@@ -224,38 +200,109 @@ def _parse_listing(result: dict) -> Listing | None:
         return None
 
 
-def _fetch_listing_details(zpid: str, session: requests.Session) -> dict:
-    """Fetch detailed listing info including description and more photos."""
-    url = f"https://www.zillow.com/graphql/"
-    query = {
-        "operationName": "ForSaleShopperPlatformFullRenderQuery",
-        "variables": {"zpid": int(zpid)},
-        "query": """query ForSaleShopperPlatformFullRenderQuery($zpid: ID!) {
-            property(zpid: $zpid) {
-                description
-                photoCount
-                photos { url }
-                yearBuilt
-                lotAreaValue
-                lotAreaUnit
+def _extract_results_from_page(page) -> list[dict]:
+    """Extract search result data embedded in the page."""
+    # Try __NEXT_DATA__ script tag first (Next.js SSR data)
+    try:
+        next_data = page.evaluate("""() => {
+            const el = document.getElementById('__NEXT_DATA__');
+            if (el) return JSON.parse(el.textContent);
+            return null;
+        }""")
+        if next_data:
+            # Navigate the Next.js data structure to find search results
+            props = next_data.get("props", {}).get("pageProps", {})
+            cat1 = props.get("searchPageState", {}).get("cat1", {})
+            results = cat1.get("searchResults", {}).get("listResults", [])
+            if results:
+                logger.info("Extracted %d results from __NEXT_DATA__", len(results))
+                return results
+    except Exception:
+        logger.debug("__NEXT_DATA__ extraction failed", exc_info=True)
+
+    # Fallback: try to find results in any inline script containing search data
+    try:
+        results = page.evaluate("""() => {
+            const scripts = document.querySelectorAll('script');
+            for (const s of scripts) {
+                const text = s.textContent || '';
+                if (text.includes('"listResults"') && text.includes('"zpid"')) {
+                    // Find the JSON object containing listResults
+                    const match = text.match(/"listResults"\\s*:\\s*(\\[.*?\\])\\s*[,}]/s);
+                    if (match) {
+                        try { return JSON.parse(match[1]); } catch(e) {}
+                    }
+                }
             }
-        }""",
-    }
+            return null;
+        }""")
+        if results:
+            logger.info("Extracted %d results from inline script", len(results))
+            return results
+    except Exception:
+        logger.debug("Inline script extraction failed", exc_info=True)
+
+    return []
+
+
+def _extract_api_results(response_data: list[dict]) -> list[dict]:
+    """Extract listing results from captured API responses."""
+    for data in response_data:
+        cat1 = data.get("cat1", {})
+        results = cat1.get("searchResults", {}).get("listResults", [])
+        if results:
+            return results
+    return []
+
+
+def _fetch_listing_details(page, listing: Listing) -> None:
+    """Navigate to a listing page and extract additional details."""
+    url = listing.url
+    if not url.startswith("http"):
+        url = f"https://www.zillow.com{url}"
 
     try:
-        resp = session.post(url, json=query, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("data", {}).get("property", {})
-    except Exception:
-        logger.debug("Failed to fetch details for zpid=%s", zpid, exc_info=True)
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        time.sleep(1)
 
-    return {}
+        details = page.evaluate("""() => {
+            const el = document.getElementById('__NEXT_DATA__');
+            if (!el) return null;
+            const data = JSON.parse(el.textContent);
+            const prop = data?.props?.pageProps?.componentProps?.gdpClientCache;
+            if (!prop) return null;
+            // gdpClientCache is a JSON string keyed by zpid
+            const parsed = JSON.parse(prop);
+            const key = Object.keys(parsed)[0];
+            const property = parsed[key]?.property;
+            if (!property) return null;
+            return {
+                description: property.description || '',
+                photos: (property.responsivePhotos || property.photos || []).map(
+                    p => p.mixedSources?.jpeg?.[0]?.url || p.url || ''
+                ).filter(Boolean),
+                yearBuilt: property.yearBuilt,
+            };
+        }""")
+
+        if details:
+            if details.get("description"):
+                listing.description = details["description"]
+            if details.get("photos"):
+                listing.photo_urls = details["photos"]
+            if details.get("yearBuilt"):
+                listing.year_built = details["yearBuilt"]
+
+    except Exception:
+        logger.debug("Failed to fetch details for %s", listing.zpid, exc_info=True)
 
 
 def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
     """
     Search Zillow for listings matching the configured criteria.
+
+    Uses Playwright to render the search page in a real browser,
+    bypassing API-level anti-bot protections.
 
     Args:
         config: The full application config dict (parsed from config.yaml).
@@ -267,87 +314,84 @@ def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
     location = config["search"].get("location", "")
     logger.info("Searching Zillow for listings in: %s", location)
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
     search_url = _build_search_url(location)
+    filter_param = _build_filter_query_param(config)
+    full_url = f"{search_url}?searchQueryState={quote_plus(filter_param)}"
 
-    # First, load the search page to get cookies (critical for auth)
-    try:
-        page_headers = {k: v for k, v in HEADERS.items() if k != "Content-Type"}
-        page_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        page_headers["sec-fetch-dest"] = "document"
-        page_headers["sec-fetch-mode"] = "navigate"
-        page_headers["sec-fetch-site"] = "none"
-        page_headers["sec-fetch-user"] = "?1"
-        resp = session.get(search_url, headers=page_headers, timeout=15)
-        resp.raise_for_status()
-        logger.info("Loaded search page, got %d cookies", len(session.cookies))
-    except requests.RequestException:
-        logger.warning("Failed to load search page, continuing without cookies")
+    result_list = []
+    api_responses: list[dict] = []
 
-    # Build and send the search API request with retry
-    query = _build_search_query(config)
-    data = None
-    max_retries = 3
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        page = context.new_page()
 
-    for attempt in range(max_retries):
+        # Intercept API responses to capture search results
+        def handle_response(response):
+            if "async-create-search-page-state" in response.url:
+                try:
+                    data = response.json()
+                    api_responses.append(data)
+                    logger.debug("Captured API response from %s", response.url)
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+
         try:
-            resp = session.put(
-                ZILLOW_SEARCH_URL,
-                json=query,
-                headers={**HEADERS, "Referer": search_url},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        except requests.RequestException:
-            if attempt < max_retries - 1:
-                wait = 2 ** (attempt + 1)
-                logger.warning(
-                    "Zillow API request failed (attempt %d/%d), retrying in %ds...",
-                    attempt + 1, max_retries, wait,
+            logger.info("Loading search page: %s", search_url)
+            page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
+
+            # Wait for results to render
+            try:
+                page.wait_for_selector(
+                    'article[data-test="property-card"], [id="grid-search-results"]',
+                    timeout=15000,
                 )
-                time.sleep(wait)
-            else:
-                logger.error("Zillow search API request failed after %d attempts", max_retries, exc_info=True)
-                return []
-        except ValueError:
-            logger.error("Failed to parse Zillow API response as JSON")
-            return []
+            except PlaywrightTimeout:
+                logger.warning("Timed out waiting for search results to render")
 
-    if data is None:
-        return []
+            # Give a moment for any remaining API calls
+            time.sleep(2)
 
-    # Parse results
-    cat1 = data.get("cat1", {})
-    search_results = cat1.get("searchResults", {})
-    result_list = search_results.get("listResults", [])
+            # Try API responses first (most reliable data format)
+            result_list = _extract_api_results(api_responses)
 
-    logger.info("Found %d raw results from Zillow", len(result_list))
+            # Fall back to extracting from page source
+            if not result_list:
+                result_list = _extract_results_from_page(page)
 
-    listings = []
-    for result in result_list:
-        listing = _parse_listing(result)
-        if listing:
-            listings.append(listing)
+            logger.info("Found %d raw results from Zillow", len(result_list))
 
-    # Optionally fetch detailed info for each listing
-    if fetch_details and listings:
-        logger.info("Fetching detailed info for %d listings...", len(listings))
-        for listing in listings:
-            details = _fetch_listing_details(listing.zpid, session)
-            if details:
-                if details.get("description"):
-                    listing.description = details["description"]
-                if details.get("photos"):
-                    photo_urls = [p["url"] for p in details["photos"] if p.get("url")]
-                    if photo_urls:
-                        listing.photo_urls = photo_urls
-                if details.get("yearBuilt"):
-                    listing.year_built = details["yearBuilt"]
-            # Rate limit to be polite
-            time.sleep(0.5)
+            # Parse results
+            listings = []
+            for result in result_list:
+                listing = _parse_listing(result)
+                if listing:
+                    listings.append(listing)
+
+            # Optionally fetch detailed info for each listing
+            if fetch_details and listings:
+                logger.info("Fetching detailed info for %d listings...", len(listings))
+                for listing in listings:
+                    _fetch_listing_details(page, listing)
+                    time.sleep(1)
+
+        except PlaywrightTimeout:
+            logger.error("Timed out loading Zillow search page")
+            listings = []
+        except Exception:
+            logger.error("Failed to search Zillow", exc_info=True)
+            listings = []
+        finally:
+            browser.close()
 
     # Apply keyword filters
     keywords = config["search"].get("keywords", [])
