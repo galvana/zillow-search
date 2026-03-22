@@ -10,6 +10,7 @@ venv/
 # Data files (contain personal listing history)
 data/seen_listings.json
 data/results/
+data/*.log
 
 # Environment
 .env
