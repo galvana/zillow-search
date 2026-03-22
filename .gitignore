@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Data files (contain personal listing history)
+data/seen_listings.json
+data/results/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,134 @@
+# Zillow House Monitor Configuration
+# ====================================
+
+# Search criteria - these map to Zillow search filters
+search:
+  # Location: city/state, zip code, or neighborhood
+  location: "Austin, TX"
+
+  # Price range (USD)
+  min_price: 300000
+  max_price: 600000
+
+  # Bedrooms
+  min_beds: 3
+  max_beds: 5
+
+  # Bathrooms
+  min_baths: 2
+  max_baths: 4
+
+  # Square footage
+  min_sqft: 1500
+  max_sqft: 4000
+
+  # Lot size in sqft (null to skip)
+  min_lot_sqft: null
+  max_lot_sqft: null
+
+  # Home type filter (list any combination)
+  # Options: SingleFamily, Condo, Townhouse, MultiFamily, Manufactured, Land, Apartment
+  home_types:
+    - SingleFamily
+    - Townhouse
+
+  # Max days on Zillow (null for any)
+  days_on_zillow: 7
+
+  # Listing status
+  # Options: ForSale, RecentlySold, ForRent
+  status: ForSale
+
+  # Keywords to search in listing description (optional, list)
+  keywords: []
+
+  # Year built range (null to skip)
+  min_year_built: 1990
+  max_year_built: null
+
+  # Has specific features (true/false/null to skip)
+  has_garage: true
+  has_pool: null
+  has_ac: true
+
+# LLM evaluation criteria
+# The monitor uses Claude's vision to evaluate listing photos and descriptions.
+# Each criterion has a description of what you're looking for and a minimum
+# score (1-10) to pass. Listings that don't meet ALL minimum scores are filtered out.
+evaluation:
+  # Whether to enable LLM evaluation (requires ANTHROPIC_API_KEY)
+  enabled: true
+
+  # Model to use for evaluation
+  model: "claude-sonnet-4-6"
+
+  # Maximum number of photos to evaluate per listing (controls API cost)
+  max_photos: 6
+
+  criteria:
+    kitchen:
+      description: >
+        Modern, updated kitchen with good counter space, quality cabinets,
+        and stainless steel or modern appliances. Prefer granite/quartz
+        countertops, island or breakfast bar, and good natural lighting.
+      min_score: 6
+
+    yard:
+      description: >
+        Spacious backyard suitable for kids and entertaining. Prefer
+        mature trees for shade, well-maintained lawn, and room for
+        outdoor activities. A patio or deck is a plus.
+      min_score: 5
+
+    appearance:
+      description: >
+        Good curb appeal with well-maintained exterior. Modern or
+        classic style that looks well cared for. Clean, move-in ready
+        interior with updated flooring and fixtures.
+      min_score: 6
+
+  # Additional custom criteria (add as many as you want)
+  # example:
+  #   bathroom:
+  #     description: "Updated bathrooms with modern fixtures"
+  #     min_score: 5
+
+# Notification settings
+notifications:
+  email:
+    enabled: true
+    # SMTP server settings
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    use_tls: true
+    # Set these via environment variables for security:
+    #   ZILLOW_EMAIL_USER, ZILLOW_EMAIL_PASSWORD
+    # Or fill in here (not recommended for shared configs)
+    username: ""
+    password: ""
+    # Who receives the alerts
+    from_address: ""
+    to_addresses:
+      - ""
+
+  # Send a summary even when no new listings are found
+  send_empty_reports: false
+
+# Monitoring schedule
+monitor:
+  # How often to check (in minutes)
+  interval_minutes: 60
+
+  # Only alert on listings not previously seen
+  track_seen_listings: true
+
+  # Path to store seen listing IDs
+  seen_listings_file: "data/seen_listings.json"
+
+  # Path to store listing results
+  results_dir: "data/results"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "data/zillow_monitor.log"
