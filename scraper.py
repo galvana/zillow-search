@@ -19,13 +19,21 @@ ZILLOW_SEARCH_URL = "https://www.zillow.com/async-create-search-page-state"
 ZILLOW_LISTING_URL = "https://www.zillow.com/homedetails/{zpid}_zpid/"
 
 HEADERS = {
-    "Accept": "application/json",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.zillow.com/",
+    "Origin": "https://www.zillow.com",
+    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 }
 
 # Mapping from config home types to Zillow's internal type codes
@@ -260,32 +268,55 @@ def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
     logger.info("Searching Zillow for listings in: %s", location)
 
     session = requests.Session()
+    session.headers.update(HEADERS)
     search_url = _build_search_url(location)
 
-    # First, load the search page to get cookies
+    # First, load the search page to get cookies (critical for auth)
     try:
-        resp = session.get(search_url, headers=HEADERS, timeout=15)
+        page_headers = {k: v for k, v in HEADERS.items() if k != "Content-Type"}
+        page_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        page_headers["sec-fetch-dest"] = "document"
+        page_headers["sec-fetch-mode"] = "navigate"
+        page_headers["sec-fetch-site"] = "none"
+        page_headers["sec-fetch-user"] = "?1"
+        resp = session.get(search_url, headers=page_headers, timeout=15)
         resp.raise_for_status()
+        logger.info("Loaded search page, got %d cookies", len(session.cookies))
     except requests.RequestException:
         logger.warning("Failed to load search page, continuing without cookies")
 
-    # Build and send the search API request
+    # Build and send the search API request with retry
     query = _build_search_query(config)
+    data = None
+    max_retries = 3
 
-    try:
-        resp = session.put(
-            ZILLOW_SEARCH_URL,
-            json=query,
-            headers={**HEADERS, "Referer": search_url},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException:
-        logger.error("Zillow search API request failed", exc_info=True)
-        return []
-    except ValueError:
-        logger.error("Failed to parse Zillow API response as JSON")
+    for attempt in range(max_retries):
+        try:
+            resp = session.put(
+                ZILLOW_SEARCH_URL,
+                json=query,
+                headers={**HEADERS, "Referer": search_url},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except requests.RequestException:
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "Zillow API request failed (attempt %d/%d), retrying in %ds...",
+                    attempt + 1, max_retries, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error("Zillow search API request failed after %d attempts", max_retries, exc_info=True)
+                return []
+        except ValueError:
+            logger.error("Failed to parse Zillow API response as JSON")
+            return []
+
+    if data is None:
         return []
 
     # Parse results
