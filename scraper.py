@@ -1,7 +1,7 @@
 """
 Zillow scraper module.
 
-Uses Playwright to browse Zillow and extract listing data, avoiding API-level blocking.
+Uses Playwright with stealth patches to browse Zillow and extract listing data.
 """
 
 import json
@@ -27,6 +27,53 @@ HOME_TYPE_MAP = {
     "Land": "LotsLand",
     "Apartment": "Apartments",
 }
+
+# JavaScript to patch common bot-detection signals
+STEALTH_SCRIPTS = """
+// Remove webdriver flag
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// Add chrome runtime object
+window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+
+// Fix permissions query
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) =>
+    parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters);
+
+// Add plugins
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin' },
+    ],
+});
+
+// Fix languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+
+// Fix platform
+Object.defineProperty(navigator, 'platform', {
+    get: () => 'MacIntel',
+});
+
+// Prevent iframe detection of automation
+for (let i = 0; i < 10; i++) {
+    const frame = document.createElement('iframe');
+    frame.style.display = 'none';
+    document.body.appendChild(frame);
+    const contentWindow = frame.contentWindow;
+    if (contentWindow) {
+        Object.defineProperty(contentWindow.navigator, 'webdriver', { get: () => undefined });
+    }
+    document.body.removeChild(frame);
+}
+"""
 
 
 @dataclass
@@ -200,8 +247,14 @@ def _parse_listing(result: dict) -> Listing | None:
         return None
 
 
-def _extract_results_from_page(page) -> list[dict]:
-    """Extract search result data embedded in the page."""
+def _parse_price(price_str: str) -> int:
+    """Parse a price string like '$450,000' into an integer."""
+    digits = re.sub(r"[^\d]", "", price_str)
+    return int(digits) if digits else 0
+
+
+def _extract_results_from_scripts(page) -> list[dict]:
+    """Extract search result data from embedded scripts in the page."""
     # Try __NEXT_DATA__ script tag first (Next.js SSR data)
     try:
         next_data = page.evaluate("""() => {
@@ -210,7 +263,6 @@ def _extract_results_from_page(page) -> list[dict]:
             return null;
         }""")
         if next_data:
-            # Navigate the Next.js data structure to find search results
             props = next_data.get("props", {}).get("pageProps", {})
             cat1 = props.get("searchPageState", {}).get("cat1", {})
             results = cat1.get("searchResults", {}).get("listResults", [])
@@ -220,14 +272,13 @@ def _extract_results_from_page(page) -> list[dict]:
     except Exception:
         logger.debug("__NEXT_DATA__ extraction failed", exc_info=True)
 
-    # Fallback: try to find results in any inline script containing search data
+    # Fallback: search inline scripts for search result data
     try:
         results = page.evaluate("""() => {
             const scripts = document.querySelectorAll('script');
             for (const s of scripts) {
                 const text = s.textContent || '';
                 if (text.includes('"listResults"') && text.includes('"zpid"')) {
-                    // Find the JSON object containing listResults
                     const match = text.match(/"listResults"\\s*:\\s*(\\[.*?\\])\\s*[,}]/s);
                     if (match) {
                         try { return JSON.parse(match[1]); } catch(e) {}
@@ -245,6 +296,117 @@ def _extract_results_from_page(page) -> list[dict]:
     return []
 
 
+def _extract_results_from_dom(page) -> list[dict]:
+    """Extract listing data directly from DOM property cards as last resort."""
+    try:
+        cards = page.evaluate("""() => {
+            const results = [];
+            // Try multiple selectors for property cards
+            const selectors = [
+                'article[data-test="property-card"]',
+                '[data-test="property-card"]',
+                'li article[id]',
+                '.property-card-data',
+                '[class*="ListItem"]',
+                '[class*="StyledPropertyCard"]',
+            ];
+
+            let elements = [];
+            for (const sel of selectors) {
+                elements = document.querySelectorAll(sel);
+                if (elements.length > 0) break;
+            }
+
+            for (const el of elements) {
+                try {
+                    // Extract zpid from element id or data attributes
+                    let zpid = el.getAttribute('data-zpid') || el.id || '';
+                    zpid = zpid.replace(/[^0-9]/g, '');
+
+                    // Extract address
+                    const addrEl = el.querySelector('[data-test="property-card-addr"], address, [class*="address"]');
+                    const address = addrEl ? addrEl.textContent.trim() : '';
+
+                    // Extract price
+                    const priceEl = el.querySelector('[data-test="property-card-price"], [class*="price"]');
+                    const priceText = priceEl ? priceEl.textContent.trim() : '';
+
+                    // Extract beds/baths/sqft
+                    const detailEl = el.querySelector('[data-test="property-card-details"], [class*="details"]');
+                    const detailText = detailEl ? detailEl.textContent : '';
+
+                    // Extract link
+                    const linkEl = el.querySelector('a[href*="/homedetails/"]') || el.querySelector('a[href]');
+                    const detailUrl = linkEl ? linkEl.getAttribute('href') : '';
+
+                    // Extract image
+                    const imgEl = el.querySelector('img[src]');
+                    const imgSrc = imgEl ? imgEl.getAttribute('src') : '';
+
+                    if (zpid || address) {
+                        results.push({
+                            zpid: zpid,
+                            address: address,
+                            price: priceText,
+                            detailText: detailText,
+                            detailUrl: detailUrl,
+                            imgSrc: imgSrc,
+                        });
+                    }
+                } catch(e) {}
+            }
+            return results;
+        }""")
+
+        if not cards:
+            return []
+
+        logger.info("Extracted %d results from DOM property cards", len(cards))
+
+        # Convert DOM data into the standard result format
+        parsed = []
+        for card in cards:
+            beds = None
+            baths = None
+            sqft = None
+            detail_text = card.get("detailText", "")
+            if detail_text:
+                bed_match = re.search(r"(\d+)\s*b(?:d|ed)", detail_text, re.I)
+                bath_match = re.search(r"(\d+(?:\.\d+)?)\s*ba", detail_text, re.I)
+                sqft_match = re.search(r"([\d,]+)\s*sq\s*ft", detail_text, re.I)
+                if bed_match:
+                    beds = int(bed_match.group(1))
+                if bath_match:
+                    baths = float(bath_match.group(1))
+                if sqft_match:
+                    sqft = int(sqft_match.group(1).replace(",", ""))
+
+            price_text = card.get("price", "")
+            price = _parse_price(price_text)
+
+            photos = []
+            if card.get("imgSrc"):
+                photos.append(card["imgSrc"])
+
+            parsed.append({
+                "zpid": card.get("zpid", ""),
+                "address": card.get("address", "Unknown"),
+                "unformattedPrice": price,
+                "beds": beds,
+                "baths": baths,
+                "area": sqft,
+                "detailUrl": card.get("detailUrl", ""),
+                "carouselPhotos": [{"url": u} for u in photos],
+                "homeType": "Unknown",
+            })
+
+        return parsed
+
+    except Exception:
+        logger.debug("DOM extraction failed", exc_info=True)
+        return []
+
+
 def _extract_api_results(response_data: list[dict]) -> list[dict]:
     """Extract listing results from captured API responses."""
     for data in response_data:
@@ -253,6 +415,51 @@ def _extract_api_results(response_data: list[dict]) -> list[dict]:
         if results:
             return results
     return []
+
+
+def _log_page_diagnostics(page) -> None:
+    """Log diagnostic info about the current page state."""
+    try:
+        title = page.title()
+        url = page.url
+        logger.info("Page diagnostics - URL: %s, Title: %s", url, title)
+
+        # Check for common block/CAPTCHA indicators
+        indicators = page.evaluate("""() => {
+            const body = document.body ? document.body.innerText.substring(0, 500) : '';
+            const hasCaptcha = !!(
+                document.querySelector('#captcha-box') ||
+                document.querySelector('[class*="captcha"]') ||
+                document.querySelector('iframe[src*="captcha"]') ||
+                document.querySelector('#px-captcha') ||
+                body.includes('Press & Hold') ||
+                body.includes('verify you are a human') ||
+                body.includes('Access Denied')
+            );
+            const hasResults = !!(
+                document.querySelector('article[data-test="property-card"]') ||
+                document.querySelector('[id="grid-search-results"]') ||
+                document.querySelector('[class*="ListItem"]')
+            );
+            const scriptCount = document.querySelectorAll('script').length;
+            return {
+                hasCaptcha,
+                hasResults,
+                scriptCount,
+                bodyPreview: body.substring(0, 300),
+            };
+        }""")
+        logger.info("Page state: captcha=%s, results=%s, scripts=%d",
+                     indicators.get("hasCaptcha"), indicators.get("hasResults"),
+                     indicators.get("scriptCount", 0))
+        if indicators.get("hasCaptcha"):
+            logger.error("CAPTCHA/bot detection triggered! Body preview: %s",
+                         indicators.get("bodyPreview", ""))
+        elif not indicators.get("hasResults"):
+            logger.warning("No result elements found. Body preview: %s",
+                           indicators.get("bodyPreview", ""))
+    except Exception:
+        logger.debug("Failed to get page diagnostics", exc_info=True)
 
 
 def _fetch_listing_details(page, listing: Listing) -> None:
@@ -271,7 +478,6 @@ def _fetch_listing_details(page, listing: Listing) -> None:
             const data = JSON.parse(el.textContent);
             const prop = data?.props?.pageProps?.componentProps?.gdpClientCache;
             if (!prop) return null;
-            // gdpClientCache is a JSON string keyed by zpid
             const parsed = JSON.parse(prop);
             const key = Object.keys(parsed)[0];
             const property = parsed[key]?.property;
@@ -301,8 +507,8 @@ def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
     """
     Search Zillow for listings matching the configured criteria.
 
-    Uses Playwright to render the search page in a real browser,
-    bypassing API-level anti-bot protections.
+    Uses Playwright with stealth patches to render the search page in a real
+    browser, bypassing API-level anti-bot protections.
 
     Args:
         config: The full application config dict (parsed from config.yaml).
@@ -322,7 +528,14 @@ def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
     api_responses: list[dict] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=(
@@ -330,7 +543,18 @@ def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
             locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
+            },
         )
+
+        # Inject stealth scripts before any page loads
+        context.add_init_script(STEALTH_SCRIPTS)
+
         page = context.new_page()
 
         # Intercept API responses to capture search results
@@ -346,27 +570,45 @@ def search_listings(config: dict, fetch_details: bool = True) -> list[Listing]:
         page.on("response", handle_response)
 
         try:
-            logger.info("Loading search page: %s", search_url)
+            logger.info("Loading search page: %s", full_url)
             page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
 
             # Wait for results to render
             try:
                 page.wait_for_selector(
-                    'article[data-test="property-card"], [id="grid-search-results"]',
+                    'article[data-test="property-card"], [id="grid-search-results"], '
+                    '[class*="ListItem"], [class*="StyledPropertyCard"]',
                     timeout=15000,
                 )
+                logger.info("Search results rendered successfully")
             except PlaywrightTimeout:
                 logger.warning("Timed out waiting for search results to render")
 
             # Give a moment for any remaining API calls
             time.sleep(2)
 
-            # Try API responses first (most reliable data format)
-            result_list = _extract_api_results(api_responses)
+            # Log diagnostics to understand page state
+            _log_page_diagnostics(page)
 
-            # Fall back to extracting from page source
+            # Strategy 1: Try captured API responses (most reliable data)
+            result_list = _extract_api_results(api_responses)
+            if result_list:
+                logger.info("Got %d results from intercepted API response", len(result_list))
+
+            # Strategy 2: Extract from embedded scripts
             if not result_list:
-                result_list = _extract_results_from_page(page)
+                result_list = _extract_results_from_scripts(page)
+
+            # Strategy 3: Parse directly from DOM as last resort
+            if not result_list:
+                logger.info("Falling back to DOM-based extraction")
+                result_list = _extract_results_from_dom(page)
+
+            if not result_list:
+                logger.error(
+                    "All extraction strategies failed. "
+                    "Zillow may be blocking this request."
+                )
 
             logger.info("Found %d raw results from Zillow", len(result_list))
 
